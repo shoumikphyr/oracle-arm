@@ -2,7 +2,7 @@ name: Crear instancia Oracle ARM
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "0 */2 * * *"
   workflow_dispatch:
 
 permissions:
@@ -16,7 +16,7 @@ concurrency:
 jobs:
   crear:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 40
     env:
       OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
       AD: "ZcAP:SA-BOGOTA-1-AD-1"
@@ -25,6 +25,8 @@ jobs:
       NOMBRE: "homelab"
       OCPUS: "2"
       MEM: "12"
+      LOOP_MIN: "25"
+      ESPERA: "120"
     steps:
       - uses: actions/setup-python@v5
         with:
@@ -48,12 +50,14 @@ jobs:
           printf '%s\n' "$SSH_PUB" | tr -d '\r' > ~/oracle-homelab.pub
           printf '{"ocpus":%s,"memoryInGBs":%s}' "$OCPUS" "$MEM" > ~/shape.json
 
-      - name: Intentar crear la instancia
+      - name: Intentar crear la instancia (varios intentos)
         id: crear
         env:
           OCI_TENANCY: ${{ secrets.OCI_TENANCY }}
         run: |
           set +e
+          RES="sin_capacidad"
+
           EXISTE=$(oci compute instance list --compartment-id "$OCI_TENANCY" --display-name "$NOMBRE" --query 'data[?"lifecycle-state"!=`TERMINATED`] | length(@)' 2>/dev/null)
           if [ "${EXISTE:-0}" -gt 0 ] 2>/dev/null; then
             echo "Ya existe una instancia llamada $NOMBRE."
@@ -61,27 +65,42 @@ jobs:
             exit 0
           fi
 
-            OUT=$(oci --no-retry compute instance launch \
-            --compartment-id "$OCI_TENANCY" \
-            --availability-domain "$AD" \
-            --shape "VM.Standard.A1.Flex" \
-            --shape-config "file://$HOME/shape.json" \
-            --subnet-id "$SUBNET" \
-            --image-id "$IMAGE" \
-            --assign-public-ip true \
-            --boot-volume-size-in-gbs 50 \
-            --display-name "$NOMBRE" \
-            --ssh-authorized-keys-file "$HOME/oracle-homelab.pub" 2>&1)
-          echo "$OUT"
+          FIN=$((SECONDS + LOOP_MIN * 60))
+          N=0
+          while true; do
+            N=$((N + 1))
+            echo "[$(date +%H:%M:%S)] Intento $N"
 
-          if echo "$OUT" | grep -q '"lifecycle-state"'; then
-            echo "resultado=creada" >> "$GITHUB_OUTPUT"
-          elif echo "$OUT" | grep -qiE 'Out of host capacity|Out of capacity|InternalError|TooManyRequests|429|500'; then
-            echo "Sin capacidad todavia."
-            echo "resultado=sin_capacidad" >> "$GITHUB_OUTPUT"
-          else
-            echo "resultado=error" >> "$GITHUB_OUTPUT"
-          fi
+            OUT=$(oci --no-retry compute instance launch \
+              --compartment-id "$OCI_TENANCY" \
+              --availability-domain "$AD" \
+              --shape "VM.Standard.A1.Flex" \
+              --shape-config "file://$HOME/shape.json" \
+              --subnet-id "$SUBNET" \
+              --image-id "$IMAGE" \
+              --assign-public-ip true \
+              --boot-volume-size-in-gbs 50 \
+              --display-name "$NOMBRE" \
+              --ssh-authorized-keys-file "$HOME/oracle-homelab.pub" 2>&1)
+            echo "$OUT"
+
+            if echo "$OUT" | grep -q '"lifecycle-state"'; then
+              RES="creada"
+              break
+            elif echo "$OUT" | grep -qiE 'Out of host capacity|Out of capacity|InternalError|TooManyRequests|429|500'; then
+              echo "Sin capacidad todavia."
+            else
+              RES="error"
+              break
+            fi
+
+            if [ "$SECONDS" -ge "$FIN" ]; then
+              break
+            fi
+            sleep "$ESPERA"
+          done
+
+          echo "resultado=$RES" >> "$GITHUB_OUTPUT"
           exit 0
 
       - name: Desactivar el flujo y avisar
