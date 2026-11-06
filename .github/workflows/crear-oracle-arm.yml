@@ -61,7 +61,7 @@ jobs:
             exit 0
           fi
 
-          OUT=$(oci compute instance launch \
+            OUT=$(oci --no-retry compute instance launch \
             --compartment-id "$OCI_TENANCY" \
             --availability-domain "$AD" \
             --shape "VM.Standard.A1.Flex" \
