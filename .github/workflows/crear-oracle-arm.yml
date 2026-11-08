@@ -1,22 +1,22 @@
 name: Crear instancia Oracle ARM
-
+ 
 on:
   schedule:
-    - cron: "0 */2 * * *"
+    - cron: "0 */3 * * *"
   workflow_dispatch:
-
+ 
 permissions:
   actions: write
   contents: read
-
+ 
 concurrency:
   group: crear-oracle-arm
   cancel-in-progress: false
-
+ 
 jobs:
   crear:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 355
     env:
       OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
       AD: "ZcAP:SA-BOGOTA-1-AD-1"
@@ -25,16 +25,16 @@ jobs:
       NOMBRE: "homelab"
       OCPUS: "2"
       MEM: "12"
-      LOOP_MIN: "25"
-      ESPERA: "120"
+      LOOP_MIN: "340"
+      ESPERA: "300"
     steps:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
+ 
       - name: Instalar OCI CLI
         run: pip install --quiet oci-cli
-
+ 
       - name: Configurar OCI y llave SSH
         env:
           OCI_USER: ${{ secrets.OCI_USER }}
@@ -49,28 +49,28 @@ jobs:
           printf '[DEFAULT]\nuser=%s\nfingerprint=%s\ntenancy=%s\nregion=sa-bogota-1\nkey_file=%s\n' "$OCI_USER" "$OCI_FINGERPRINT" "$OCI_TENANCY" "$HOME/.oci/oci_api_key.pem" > ~/.oci/config
           printf '%s\n' "$SSH_PUB" | tr -d '\r' > ~/oracle-homelab.pub
           printf '{"ocpus":%s,"memoryInGBs":%s}' "$OCPUS" "$MEM" > ~/shape.json
-
-      - name: Intentar crear la instancia (varios intentos)
+ 
+      - name: Intentar crear la instancia (cada 5 min, ~5.7 h)
         id: crear
         env:
           OCI_TENANCY: ${{ secrets.OCI_TENANCY }}
         run: |
           set +e
           RES="sin_capacidad"
-
+ 
           EXISTE=$(oci compute instance list --compartment-id "$OCI_TENANCY" --display-name "$NOMBRE" --query 'data[?"lifecycle-state"!=`TERMINATED`] | length(@)' 2>/dev/null)
           if [ "${EXISTE:-0}" -gt 0 ] 2>/dev/null; then
             echo "Ya existe una instancia llamada $NOMBRE."
             echo "resultado=existe" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-
+ 
           FIN=$((SECONDS + LOOP_MIN * 60))
           N=0
           while true; do
             N=$((N + 1))
             echo "[$(date +%H:%M:%S)] Intento $N"
-
+ 
             OUT=$(oci --no-retry compute instance launch \
               --compartment-id "$OCI_TENANCY" \
               --availability-domain "$AD" \
@@ -82,27 +82,28 @@ jobs:
               --boot-volume-size-in-gbs 50 \
               --display-name "$NOMBRE" \
               --ssh-authorized-keys-file "$HOME/oracle-homelab.pub" 2>&1)
-            echo "$OUT"
-
+ 
             if echo "$OUT" | grep -q '"lifecycle-state"'; then
+              echo "$OUT"
               RES="creada"
               break
             elif echo "$OUT" | grep -qiE 'Out of host capacity|Out of capacity|InternalError|TooManyRequests|429|500'; then
               echo "Sin capacidad todavia."
             else
+              echo "$OUT"
               RES="error"
               break
             fi
-
+ 
             if [ "$SECONDS" -ge "$FIN" ]; then
               break
             fi
             sleep "$ESPERA"
           done
-
+ 
           echo "resultado=$RES" >> "$GITHUB_OUTPUT"
           exit 0
-
+ 
       - name: Desactivar el flujo y avisar
         if: steps.crear.outputs.resultado != 'sin_capacidad'
         env:
