@@ -85,6 +85,7 @@ jobs:
           fi
 
       - name: Intentar crear la instancia (6 intentos, cada 5 min)
+        id: crear
         if: steps.existe.outputs.encontrada == 'false'
         env:
           OCI_TENANCY: ${{ secrets.OCI_TENANCY }}
@@ -109,22 +110,30 @@ jobs:
             python - "$OCI_LOG" <<'PY'
           import ast
           import json
+          import os
           import re
           import sys
 
           log = open(sys.argv[1], encoding="utf-8", errors="replace").read()
           fields = {"status", "code", "message", "opc-request-id", "operation_name", "timestamp"}
           found = False
-          for line in log.splitlines():
+          decoder = json.JSONDecoder()
+          for offset, character in enumerate(log):
+              if character != "{":
+                  continue
               try:
-                  response = json.loads(line)
-              except (json.JSONDecodeError, TypeError):
+                  response, _ = decoder.raw_decode(log, offset)
+              except json.JSONDecodeError:
                   continue
               instance = response.get("data", {}) if isinstance(response, dict) else {}
               if isinstance(instance, dict) and "lifecycle-state" in instance:
                   for key in ("id", "display-name", "lifecycle-state", "availability-domain"):
                       if key in instance:
                           print(f"Instancia {key}: {instance[key]}")
+                  with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                      output.write("resultado=creada\n")
+                      output.write(f"instance_id={instance.get('id', '')}\n")
+                      output.write(f"lifecycle_state={instance.get('lifecycle-state', '')}\n")
                   found = True
           for line in log.splitlines():
               if "ServiceError" not in line:
@@ -175,6 +184,63 @@ jobs:
             echo "::error::OCI devolvió un error distinto a falta de capacidad (código $RC). No se reintentará; revisa el detalle anterior."
             exit 1
           done
+
+      - name: Notificar por correo la creación confirmada
+        if: steps.crear.outputs.resultado == 'creada'
+        continue-on-error: true
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          INSTANCE_ID: ${{ steps.crear.outputs.instance_id }}
+          INSTANCE_STATE: ${{ steps.crear.outputs.lifecycle_state }}
+        run: |
+          set -euo pipefail
+          for name in SMTP_HOST SMTP_USERNAME SMTP_PASSWORD EMAIL_FROM EMAIL_TO; do
+            if [ -z "${!name:-}" ]; then
+              echo "::warning::La instancia se creó, pero no se envió correo: configura los secretos SMTP_HOST, SMTP_USERNAME, SMTP_PASSWORD, EMAIL_FROM y EMAIL_TO."
+              exit 0
+            fi
+          done
+          export SMTP_PORT="${SMTP_PORT:-587}"
+          python - <<'PY'
+          import os
+          import smtplib
+          import ssl
+          from email.message import EmailMessage
+
+          message = EmailMessage()
+          message["Subject"] = "Instancia Oracle ARM creada"
+          message["From"] = os.environ["EMAIL_FROM"]
+          message["To"] = os.environ["EMAIL_TO"]
+          message.set_content(
+              "Oracle confirmó la creación de tu instancia.\n\n"
+              f"Nombre: {os.environ['NOMBRE']}\n"
+              "Región: Bogotá (sa-bogota-1)\n"
+              "Forma: VM.Standard.A1.Flex, 1 OCPU y 6 GB RAM\n"
+              f"Estado inicial: {os.environ.get('INSTANCE_STATE', 'desconocido')}\n"
+              f"OCID: {os.environ.get('INSTANCE_ID', 'no disponible')}\n"
+              f"Ejecución: {os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}\n"
+          )
+
+          host = os.environ["SMTP_HOST"]
+          port = int(os.environ["SMTP_PORT"])
+          if port == 465:
+              with smtplib.SMTP_SSL(host, port, context=ssl.create_default_context(), timeout=30) as server:
+                  server.login(os.environ["SMTP_USERNAME"], os.environ["SMTP_PASSWORD"])
+                  server.send_message(message)
+          else:
+              with smtplib.SMTP(host, port, timeout=30) as server:
+                  server.ehlo()
+                  server.starttls(context=ssl.create_default_context())
+                  server.ehlo()
+                  server.login(os.environ["SMTP_USERNAME"], os.environ["SMTP_PASSWORD"])
+                  server.send_message(message)
+          print("Correo de creación enviado.")
+          PY
 
       - name: Resumen
         if: always()
