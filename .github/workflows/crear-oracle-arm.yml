@@ -1,6 +1,8 @@
 name: Crear instancia Oracle ARM
 
 on:
+  schedule:
+    - cron: "0 */3 * * *"
   workflow_dispatch:
     inputs:
       confirmar_creacion:
@@ -21,7 +23,7 @@ concurrency:
 
 jobs:
   crear:
-    if: ${{ inputs.confirmar_creacion == 'SI' }}
+    if: ${{ github.event_name == 'schedule' || inputs.confirmar_creacion == 'SI' }}
     runs-on: ubuntu-latest
     timeout-minutes: 35
     env:
@@ -186,7 +188,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   sin-confirmacion:
-    if: ${{ inputs.confirmar_creacion != 'SI' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.confirmar_creacion != 'SI' }}
     runs-on: ubuntu-latest
     steps:
       - run: echo "No se creó nada. Para intentar aprovisionar, ejecuta el workflow manualmente y selecciona SI."
