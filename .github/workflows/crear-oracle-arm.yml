@@ -1,41 +1,48 @@
 name: Crear instancia Oracle ARM
- 
+
 on:
-  schedule:
-    - cron: "0 */3 * * *"
   workflow_dispatch:
- 
+    inputs:
+      confirmar_creacion:
+        description: "Escribe SI para intentar crear la VM (1 OCPU / 6 GB)"
+        required: true
+        type: choice
+        options:
+          - NO
+          - SI
+        default: NO
+
 permissions:
-  actions: write
   contents: read
- 
+
 concurrency:
   group: crear-oracle-arm
   cancel-in-progress: false
- 
+
 jobs:
   crear:
+    if: ${{ inputs.confirmar_creacion == 'SI' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 35
     env:
       OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
       AD: "ZcAP:SA-BOGOTA-1-AD-1"
       SUBNET: "ocid1.subnet.oc1.sa-bogota-1.aaaaaaaa34zyhmlq2wv4x5npbmvnyn26qi55ifdpifmmkjscbaa5bjqvvw4q"
       IMAGE: "ocid1.image.oc1.sa-bogota-1.aaaaaaaaapcabg47errjuz4xikytbhgl57una6jlwli7y2slj7p2yb4ezqda"
       NOMBRE: "homelab"
-      OCPUS: "2"
-      MEM: "12"
-      LOOP_MIN: "340"
+      OCPUS: "1"
+      MEM: "6"
+      INTENTOS: "6"
       ESPERA: "300"
     steps:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
- 
+
       - name: Instalar OCI CLI
         run: pip install --quiet oci-cli
- 
-      - name: Configurar OCI y llave SSH
+
+      - name: Validar secretos y configurar OCI
         env:
           OCI_USER: ${{ secrets.OCI_USER }}
           OCI_TENANCY: ${{ secrets.OCI_TENANCY }}
@@ -43,34 +50,46 @@ jobs:
           OCI_KEY: ${{ secrets.OCI_KEY }}
           SSH_PUB: ${{ secrets.SSH_PUB }}
         run: |
+          set -euo pipefail
+          for name in OCI_USER OCI_TENANCY OCI_FINGERPRINT OCI_KEY SSH_PUB; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Falta el secreto requerido: $name"
+              exit 1
+            fi
+          done
           mkdir -p ~/.oci
           printf '%s\n' "$OCI_KEY" | tr -d '\r' > ~/.oci/oci_api_key.pem
           chmod 600 ~/.oci/oci_api_key.pem
           printf '[DEFAULT]\nuser=%s\nfingerprint=%s\ntenancy=%s\nregion=sa-bogota-1\nkey_file=%s\n' "$OCI_USER" "$OCI_FINGERPRINT" "$OCI_TENANCY" "$HOME/.oci/oci_api_key.pem" > ~/.oci/config
           printf '%s\n' "$SSH_PUB" | tr -d '\r' > ~/oracle-homelab.pub
           printf '{"ocpus":%s,"memoryInGBs":%s}' "$OCPUS" "$MEM" > ~/shape.json
- 
-      - name: Intentar crear la instancia (cada 5 min, ~5.7 h)
-        id: crear
+
+      - name: Comprobar si ya existe la instancia
+        id: existe
         env:
           OCI_TENANCY: ${{ secrets.OCI_TENANCY }}
         run: |
-          set +e
-          RES="sin_capacidad"
- 
-          EXISTE=$(oci compute instance list --compartment-id "$OCI_TENANCY" --display-name "$NOMBRE" --query 'data[?"lifecycle-state"!=`TERMINATED`] | length(@)' 2>/dev/null)
-          if [ "${EXISTE:-0}" -gt 0 ] 2>/dev/null; then
-            echo "Ya existe una instancia llamada $NOMBRE."
-            echo "resultado=existe" >> "$GITHUB_OUTPUT"
-            exit 0
+          set -euo pipefail
+          if ! EXISTE=$(oci compute instance list --compartment-id "$OCI_TENANCY" --display-name "$NOMBRE" --all --query 'data[?"lifecycle-state"!=`TERMINATED`] | length(@)' --raw-output 2>&1); then
+            echo "$EXISTE"
+            echo "::error::No se pudo consultar OCI; se cancela para evitar crear una VM duplicada."
+            exit 1
           fi
- 
-          FIN=$((SECONDS + LOOP_MIN * 60))
-          N=0
-          while true; do
-            N=$((N + 1))
-            echo "[$(date +%H:%M:%S)] Intento $N"
- 
+          if [ "${EXISTE:-0}" -gt 0 ]; then
+            echo "Ya existe una instancia llamada $NOMBRE; no se enviará otra solicitud."
+            echo "encontrada=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "encontrada=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Intentar crear la instancia (6 intentos, cada 5 min)
+        if: steps.existe.outputs.encontrada == 'false'
+        env:
+          OCI_TENANCY: ${{ secrets.OCI_TENANCY }}
+        run: |
+          set -uo pipefail
+          for N in $(seq 1 "$INTENTOS"); do
+            echo "[$(date -u +%H:%M:%S) UTC] Intento $N de $INTENTOS"
             OUT=$(oci --no-retry compute instance launch \
               --compartment-id "$OCI_TENANCY" \
               --availability-domain "$AD" \
@@ -82,38 +101,41 @@ jobs:
               --boot-volume-size-in-gbs 50 \
               --display-name "$NOMBRE" \
               --ssh-authorized-keys-file "$HOME/oracle-homelab.pub" 2>&1)
- 
-            if echo "$OUT" | grep -q '"lifecycle-state"'; then
-              echo "$OUT"
-              RES="creada"
-              break
-            elif echo "$OUT" | grep -qiE 'Out of host capacity|Out of capacity|InternalError|TooManyRequests|429|500'; then
-              echo "Sin capacidad todavia."
-            else
-              echo "$OUT"
-              RES="error"
-              break
+            RC=$?
+            printf '%s\n' "$OUT"
+
+            if [ "$RC" -eq 0 ] && echo "$OUT" | grep -q '"lifecycle-state"'; then
+              echo "::notice::OCI aceptó la creación de la instancia. Revisa su estado en la consola."
+              exit 0
             fi
- 
-            if [ "$SECONDS" -ge "$FIN" ]; then
-              break
+
+            if echo "$OUT" | grep -qiE 'Out of host capacity|Out of capacity'; then
+              if [ "$N" -lt "$INTENTOS" ]; then
+                echo "OCI reportó falta de capacidad física; se reintentará en 5 minutos."
+                sleep "$ESPERA"
+                continue
+              fi
+              echo "::error::Sin capacidad física después de $INTENTOS intentos. El run se marca como fallido para que el problema sea visible."
+              exit 1
             fi
-            sleep "$ESPERA"
+
+            echo "::error::OCI devolvió un error distinto a falta de capacidad (código $RC). No se reintentará; revisa el detalle anterior."
+            exit 1
           done
- 
-          echo "resultado=$RES" >> "$GITHUB_OUTPUT"
-          exit 0
- 
-      - name: Desactivar el flujo y avisar
-        if: steps.crear.outputs.resultado != 'sin_capacidad'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RESULTADO: ${{ steps.crear.outputs.resultado }}
+
+      - name: Resumen
+        if: always()
         run: |
-          gh workflow disable crear-oracle-arm.yml --repo "$GITHUB_REPOSITORY"
-          if [ "$RESULTADO" = "creada" ]; then
-            echo "::error::INSTANCIA CREADA. Revisa Computacion > Instancias en Oracle."
-          else
-            echo "::error::El flujo se detuvo. Resultado: $RESULTADO. Revisa el log del paso anterior."
-          fi
-          exit 1
+          {
+            echo "### Oracle ARM"
+            echo "- Región: Bogotá"
+            echo "- Tamaño solicitado: VM.Standard.A1.Flex, 1 OCPU y 6 GB de RAM"
+            echo "- Reintentos máximos: $INTENTOS"
+            echo "- Revisa el paso de creación para el mensaje completo de OCI."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  sin-confirmacion:
+    if: ${{ inputs.confirmar_creacion != 'SI' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "No se creó nada. Para intentar aprovisionar, ejecuta el workflow manualmente y selecciona SI."
