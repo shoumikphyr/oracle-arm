@@ -88,6 +88,7 @@ jobs:
           OCI_TENANCY: ${{ secrets.OCI_TENANCY }}
         run: |
           set -uo pipefail
+          set +e
           for N in $(seq 1 "$INTENTOS"); do
             echo "[$(date -u +%H:%M:%S) UTC] Intento $N de $INTENTOS"
             OCI_LOG=$(mktemp)
