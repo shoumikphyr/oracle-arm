@@ -90,7 +90,8 @@ jobs:
           set -uo pipefail
           for N in $(seq 1 "$INTENTOS"); do
             echo "[$(date -u +%H:%M:%S) UTC] Intento $N de $INTENTOS"
-            OUT=$(oci --no-retry compute instance launch \
+            OCI_LOG=$(mktemp)
+            oci --debug --no-retry compute instance launch \
               --compartment-id "$OCI_TENANCY" \
               --availability-domain "$AD" \
               --shape "VM.Standard.A1.Flex" \
@@ -100,16 +101,64 @@ jobs:
               --assign-public-ip true \
               --boot-volume-size-in-gbs 50 \
               --display-name "$NOMBRE" \
-              --ssh-authorized-keys-file "$HOME/oracle-homelab.pub" 2>&1)
+              --ssh-authorized-keys-file "$HOME/oracle-homelab.pub" >"$OCI_LOG" 2>&1
             RC=$?
-            printf '%s\n' "$OUT"
+            python - "$OCI_LOG" <<'PY'
+          import ast
+          import json
+          import re
+          import sys
 
-            if [ "$RC" -eq 0 ] && echo "$OUT" | grep -q '"lifecycle-state"'; then
+          log = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+          fields = {"status", "code", "message", "opc-request-id", "operation_name", "timestamp"}
+          found = False
+          for line in log.splitlines():
+              try:
+                  response = json.loads(line)
+              except (json.JSONDecodeError, TypeError):
+                  continue
+              instance = response.get("data", {}) if isinstance(response, dict) else {}
+              if isinstance(instance, dict) and "lifecycle-state" in instance:
+                  for key in ("id", "display-name", "lifecycle-state", "availability-domain"):
+                      if key in instance:
+                          print(f"Instancia {key}: {instance[key]}")
+                  found = True
+          for line in log.splitlines():
+              if "ServiceError" not in line:
+                  continue
+              start, end = line.find("{"), line.rfind("}")
+              if start < 0 or end <= start:
+                  continue
+              try:
+                  error = ast.literal_eval(line[start:end + 1])
+              except (SyntaxError, ValueError):
+                  continue
+              if not isinstance(error, dict):
+                  continue
+              for key in fields:
+                  if key in error:
+                      print(f"OCI {key}: {error[key]}")
+                      found = True
+          if not found:
+              for pattern, label in ((r"['\"]status['\"]\s*:\s*(\d+)", "status"),
+                                     (r"['\"]code['\"]\s*:\s*['\"]([^'\"]+)['\"]", "code"),
+                                     (r"['\"]opc-request-id['\"]\s*:\s*['\"]([^'\"]+)['\"]", "opc-request-id")):
+                  match = re.search(pattern, log)
+                  if match:
+                      print(f"OCI {label}: {match.group(1)}")
+                      found = True
+          if not found:
+              print("OCI CLI no expuso campos estructurados del error; el log detallado se mantuvo fuera de la salida por seguridad.")
+          PY
+
+            if [ "$RC" -eq 0 ] && grep -q '"lifecycle-state"' "$OCI_LOG"; then
               echo "::notice::OCI aceptó la creación de la instancia. Revisa su estado en la consola."
+              rm -f "$OCI_LOG"
               exit 0
             fi
 
-            if echo "$OUT" | grep -qiE 'Out of host capacity|Out of capacity'; then
+            if grep -qiE 'Out of host capacity|Out of capacity' "$OCI_LOG"; then
+              rm -f "$OCI_LOG"
               if [ "$N" -lt "$INTENTOS" ]; then
                 echo "OCI reportó falta de capacidad física; se reintentará en 5 minutos."
                 sleep "$ESPERA"
@@ -119,6 +168,7 @@ jobs:
               exit 1
             fi
 
+            rm -f "$OCI_LOG"
             echo "::error::OCI devolvió un error distinto a falta de capacidad (código $RC). No se reintentará; revisa el detalle anterior."
             exit 1
           done
